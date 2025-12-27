@@ -25,7 +25,7 @@ jobs:
           - os: macos-latest
             artifact_name: pkgtime
             asset_name: pkgtime-macos-arm64
-          - os: macos-13
+          - os: macos-15
             artifact_name: pkgtime
             asset_name: pkgtime-macos-amd64
 
