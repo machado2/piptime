@@ -1,143 +1,94 @@
-# piptime & npmtime
+# pkgtime
 
-**Time Machine for PIP and NPM packages.**
+**Universal Time Machine for Package Managers.**
 
-Find the latest version of a package that was available before a specific date. Extremely useful for reproducing old environments or pinning dependencies for legacy projects.
+`pkgtime` is a single, unified CLI tool written in Rust that finds the latest version of a package available before a specific date. It is the successor to `piptime.py` and `npmtime.js`.
 
-## Tools
+## Supported Managers
 
-| Tool | Language | Registry |
-|------|----------|----------|
-| `piptime.py` | Python | [PyPI](https://pypi.org) |
-| `npmtime.js` | Node.js | [npm](https://npmjs.com) |
+| Manager | CLI Arg | Registry |
+|---------|---------|----------|
+| **Pip** | `pip` | [PyPI](https://pypi.org) |
+| **Npm** | `npm` | [npm](https://npmjs.com) |
+| **Cargo** | `cargo` | [Crates.io](https://crates.io) |
+| **Gem** | `gem` | [RubyGems](https://rubygems.org) |
+| **Composer** | `composer` | [Packagist](https://packagist.org) |
 
-## Features
+## Installation
 
--   Finds the latest version of a package released on or before a target date.
--   Supports multiple packages in a single run.
--   Outputs precise installation commands (e.g., `package==1.2.3` or `package@1.2.3`).
--   Ignores releases with no attached files (pip) or invalid dates.
--   Colored terminal output for better readability.
+### From Source
 
----
-
-## piptime.py
-
-### Prerequisites
-
--   Python 3.6+
--   `requests` library
-
-### Installation
+Ensure you have Rust/Cargo installed.
 
 ```bash
-pip install requests
+cargo install --path .
 ```
 
-### Usage
+This will install the `pkgtime` binary to your Cargo bin path.
+
+## Usage
 
 ```bash
-python piptime.py <DATE> <PACKAGE_1> <PACKAGE_2> ...
+pkgtime <MANAGER> <DATE> <PACKAGES...> [OPTIONS]
 ```
 
-### Examples
+### Arguments
 
-**Find the version of `requests` available on January 1st, 2020:**
+- `MANAGER`: The package manager to target. Values: `pip`, `npm`, `cargo`, `gem`.
+- `DATE`: Cutoff date in `YYYY-MM-DD` format.
+- `PACKAGES`: Space-separated list of packages to check.
 
+### Options
+
+- `-v, --verbose`: Enable verbose output (shows HTTP requests and rejected versions).
+- `-h, --help`: Show help information.
+
+## Examples
+
+### Python (pip)
+Find `requests` version from Jan 1st, 2020:
 ```bash
-python piptime.py 2020-01-01 requests
+pkgtime pip 2020-01-01 requests
+# Output: pip install requests==2.22.0
 ```
 
-**Find versions for multiple packages:**
-
+### Node.js (npm)
+Find versions for `express` and `lodash`:
 ```bash
-python piptime.py 2022-06-15 numpy pandas scipy
+pkgtime npm 2020-01-15 express lodash
+# Output: npm install express@4.17.1 lodash@4.17.15
 ```
 
-**Verbose mode (shows version history analysis):**
-
+### Rust (cargo)
+Find `serde` version for 2021:
 ```bash
-python piptime.py 2021-01-01 flask -v
+pkgtime cargo 2021-06-01 serde
+# Output: serde = "=1.0.126"
 ```
 
-### Output
-
-```text
---- Searching for versions up to 2020-01-01 ---
-✅ requests: 2.22.0 (from 2019-05-16)
-------------------------------------------------------------
-Copy and paste into your Dockerfile/requirements.txt:
-
-pip install requests==2.22.0
-```
-
----
-
-## npmtime.js
-
-### Prerequisites
-
--   Node.js 18+ (uses native `fetch`)
-
-### Usage
-
+### Ruby (gem)
+Find `rails` version from 2015:
 ```bash
-node npmtime.js <DATE> <PACKAGE_1> <PACKAGE_2> ...
+pkgtime gem 2015-01-01 rails
+# Output: gem 'rails', '4.2.0'
 ```
 
-### Examples
-
-**Find the version of `express` available on January 15th, 2020:**
-
+### PHP (Composer)
+Find `monolog` version from 2021:
 ```bash
-node npmtime.js 2020-01-15 express
-```
-
-**Find versions for multiple packages:**
-
-```bash
-node npmtime.js 2019-06-01 react react-dom axios
-```
-
-**Verbose mode (shows version history analysis):**
-
-```bash
-node npmtime.js 2020-01-01 lodash -v
-```
-
-### Output
-
-```text
---- Searching for versions up to 2020-01-15 ---
-✅ express: 4.17.1 (from 2019-05-26)
-------------------------------------------------------------
-Copy and paste into your Dockerfile/package.json:
-
-npm install express@4.17.1
+pkgtime composer 2021-01-01 monolog/monolog
+# Output: composer require monolog/monolog:2.2.0
 ```
 
 ---
 
-## Use Cases
+## Legacy Scripts
 
-### Reproducing Old CI/CD Builds
+This repository also contains the original prototype scripts:
+- `piptime.py` (Python)
+- `npmtime.js` (Node.js)
 
-Need to debug why a build from 2019 is failing? Find the exact dependency versions that were current at that time:
-
-```bash
-python piptime.py 2019-03-15 boto3 requests flask
-node npmtime.js 2019-03-15 express lodash moment
-```
-
-### Legacy Project Maintenance
-
-Working on an old project that needs specific dependency versions? Find compatible versions from when the project was active.
-
-### Security Research
-
-Investigating when a vulnerability was introduced? Find the package version that was available on a specific date.
-
----
+These are kept for reference but `pkgtime` is the recommended tool.
 
 ## License
 
