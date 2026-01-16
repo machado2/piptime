@@ -32,6 +32,13 @@ This will install the `pkgtime` binary to your Cargo bin path.
 pkgtime <MANAGER> <DATE> <PACKAGES...> [OPTIONS]
 ```
 
+### Overlap mode (pip)
+Given an anchor package version, prints which versions of other packages were “latest” during the time window where the anchor version was the newest (from its release until the next release):
+
+```bash
+pkgtime overlap pip requests==2.25.0 urllib3 idna chardet
+```
+
 ### Arguments
 
 - `MANAGER`: The package manager to target. Values: `pip`, `npm`, `cargo`, `gem`.

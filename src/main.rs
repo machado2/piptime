@@ -1,28 +1,51 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// The package manager to use
+    #[arg(value_enum)]
+    manager: Option<Manager>,
+
+    /// The cutoff date (YYYY-MM-DD)
+    date: Option<String>,
+
+    /// List of packages to check
+    packages: Vec<String>,
+
+    /// Verbose output
+    #[arg(short, long, global = true)]
+    verbose: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Find versions that were "latest" during an anchor package-version window
+    /// (from the anchor release time until the next release time).
+    Overlap(OverlapArgs),
+}
+
+#[derive(Parser, Debug)]
+struct OverlapArgs {
     /// The package manager to use
     #[arg(value_enum)]
     manager: Manager,
 
-    /// The cutoff date (YYYY-MM-DD)
-    date: String,
+    /// Anchor spec in pip-style format: <package>==<version>
+    anchor: String,
 
     /// List of packages to check
     #[arg(required = true)]
     packages: Vec<String>,
-
-    /// Verbose output
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -39,6 +62,12 @@ struct PackageVersion {
     date: DateTime<Utc>,
 }
 
+struct WindowedVersion {
+    version: String,
+    overlap_start: DateTime<Utc>,
+    overlap_end: DateTime<Utc>,
+}
+
 fn main() -> Result<()> {
     // Enable color support on Windows
     #[cfg(windows)]
@@ -46,15 +75,34 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    if let Some(command) = args.command {
+        return match command {
+            Command::Overlap(o) => run_overlap(o, args.verbose),
+        };
+    }
+
+    let manager = args
+        .manager
+        .context("Missing MANAGER argument (or use a subcommand)")?;
+    let date = args
+        .date
+        .context("Missing DATE argument (or use a subcommand)")?;
+
+    if args.packages.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Missing PACKAGES argument(s) (or use a subcommand)"
+        ));
+    }
+
     // Parse date
-    let naive_date = NaiveDate::parse_from_str(&args.date, "%Y-%m-%d")
+    let naive_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .context("Invalid date format. Use YYYY-MM-DD")?;
     // Set time to end of day to include releases on that day
     let target_date = naive_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
 
     println!(
         "--- Searching for {} packages up to {} ---",
-        format!("{:?}", args.manager).yellow(),
+        format!("{:?}", manager).yellow(),
         target_date.date_naive().to_string().yellow()
     );
 
@@ -66,7 +114,7 @@ fn main() -> Result<()> {
     let mut errors = Vec::new();
 
     for pkg in &args.packages {
-        match find_version(&client, args.manager, pkg, target_date, args.verbose) {
+        match find_version(&client, manager, pkg, target_date, args.verbose) {
             Ok(Some(v)) => {
                 println!(
                     "✅ {}: {} (from {})",
@@ -75,7 +123,7 @@ fn main() -> Result<()> {
                     v.date.date_naive()
                 );
 
-                let cmd = match args.manager {
+                let cmd = match manager {
                     Manager::Pip => format!("{}=={}", pkg, v.version),
                     Manager::Npm => format!("{}@{}", pkg, v.version),
                     Manager::Cargo => format!("{} = \"={}\"", pkg, v.version),
@@ -99,7 +147,86 @@ fn main() -> Result<()> {
     println!("{}", "-".repeat(60));
 
     if !install_cmds.is_empty() {
-        print_install_instructions(args.manager, &install_cmds);
+        print_install_instructions(manager, &install_cmds);
+    }
+
+    if !errors.is_empty() {
+        println!("\n{}", "Attention to errors:".yellow());
+        for err in errors {
+            println!(" - {}", err);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_overlap(args: OverlapArgs, verbose: bool) -> Result<()> {
+    if args.manager != Manager::Pip {
+        return Err(anyhow::anyhow!(
+            "The overlap command is currently only supported for 'pip'"
+        ));
+    }
+
+    let (anchor_pkg, anchor_ver) = parse_pip_spec(&args.anchor)?;
+
+    let client = Client::builder()
+        .user_agent("pkgtime/1.0 (pkgtime-tool)")
+        .build()?;
+
+    let anchor_releases = fetch_pip_releases(&client, &anchor_pkg, verbose).with_context(|| {
+        format!(
+            "Failed to fetch releases for anchor package '{}'",
+            anchor_pkg
+        )
+    })?;
+
+    let (window_start, window_end) = pip_anchor_window(&anchor_pkg, &anchor_ver, &anchor_releases)?;
+
+    println!(
+        "--- Overlap window for {} ---",
+        format!("{}=={}", anchor_pkg, anchor_ver).yellow()
+    );
+    println!(
+        "Window: {} -> {}",
+        window_start.to_rfc3339().yellow(),
+        window_end.to_rfc3339().yellow()
+    );
+    println!("{}", "-".repeat(60));
+
+    let mut errors = Vec::new();
+
+    for pkg in &args.packages {
+        match fetch_pip_releases(&client, pkg, verbose) {
+            Ok(releases) => {
+                let overlaps = versions_overlapping_window(&releases, window_start, window_end);
+                if overlaps.is_empty() {
+                    println!(
+                        "{}: {}",
+                        pkg.yellow(),
+                        "no overlapping latest versions".dimmed()
+                    );
+                    continue;
+                }
+
+                let parts: Vec<String> = overlaps
+                    .into_iter()
+                    .map(|o| {
+                        format!(
+                            "{} ({}..{})",
+                            o.version.bold(),
+                            o.overlap_start.date_naive(),
+                            o.overlap_end.date_naive()
+                        )
+                    })
+                    .collect();
+
+                println!("{}: {}", pkg.green(), parts.join(", "));
+            }
+            Err(e) => {
+                println!("❌ {}: {}", pkg.red(), e);
+                errors.push(format!("{}: {}", pkg, e));
+            }
+        }
     }
 
     if !errors.is_empty() {
@@ -161,19 +288,49 @@ fn find_version(
 // --- PIP Strategy ---
 #[derive(Deserialize)]
 struct PipReleaseFile {
-    upload_time: String,
+    #[serde(default)]
+    upload_time: Option<String>,
+    #[serde(default)]
+    upload_time_iso_8601: Option<String>,
 }
 #[derive(Deserialize)]
 struct PipData {
     releases: HashMap<String, Vec<PipReleaseFile>>,
 }
 
-fn find_pip(
-    client: &Client,
-    pkg: &str,
-    target_date: DateTime<Utc>,
-    verbose: bool,
-) -> Result<Option<PackageVersion>> {
+fn parse_pip_spec(spec: &str) -> Result<(String, String)> {
+    let (name, version) = spec
+        .split_once("==")
+        .context("Anchor must be in format <package>==<version>")?;
+
+    if name.trim().is_empty() || version.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Anchor must be in format <package>==<version>"
+        ));
+    }
+
+    Ok((name.trim().to_string(), version.trim().to_string()))
+}
+
+fn pip_file_upload_time(file: &PipReleaseFile) -> Option<DateTime<Utc>> {
+    if let Some(ts) = &file.upload_time_iso_8601 {
+        if let Ok(date) = DateTime::parse_from_rfc3339(ts) {
+            return Some(date.with_timezone(&Utc));
+        }
+    }
+
+    if let Some(ts) = &file.upload_time {
+        // "2019-05-16T17:21:44" (typically UTC but without timezone info)
+        let layout = "%Y-%m-%dT%H:%M:%S";
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(ts, layout) {
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+        }
+    }
+
+    None
+}
+
+fn fetch_pip_releases(client: &Client, pkg: &str, verbose: bool) -> Result<Vec<PackageVersion>> {
     let url = format!("https://pypi.org/pypi/{}/json", pkg);
     if verbose {
         println!(" -> Fetching {}", url);
@@ -185,24 +342,34 @@ fn find_pip(
     }
     let data: PipData = resp.json()?;
 
-    let mut candidates = Vec::new();
+    let mut releases = Vec::new();
 
     for (version, files) in data.releases {
-        if let Some(first_file) = files.first() {
-            // "2019-05-16T17:21:44"
-            let layout = "%Y-%m-%dT%H:%M:%S";
-            // Pip timestamps are typically UTC but without timezone info in string
-            if let Ok(naive) =
-                chrono::NaiveDateTime::parse_from_str(&first_file.upload_time, layout)
-            {
-                let date = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
-                if date <= target_date {
-                    candidates.push(PackageVersion { version, date });
-                }
-            }
+        let first_upload = files
+            .into_iter()
+            .filter_map(|f| pip_file_upload_time(&f))
+            .min();
+        if let Some(date) = first_upload {
+            releases.push(PackageVersion { version, date });
         }
     }
 
+    releases.sort_by_key(|v| v.date);
+    Ok(releases)
+}
+
+fn find_pip(
+    client: &Client,
+    pkg: &str,
+    target_date: DateTime<Utc>,
+    verbose: bool,
+) -> Result<Option<PackageVersion>> {
+    let releases = fetch_pip_releases(client, pkg, verbose)?;
+
+    let candidates = releases
+        .into_iter()
+        .filter(|v| v.date <= target_date)
+        .collect();
     Ok(select_champion(candidates))
 }
 
@@ -400,4 +567,126 @@ fn select_champion(mut candidates: Vec<PackageVersion>) -> Option<PackageVersion
     candidates.sort_by_key(|v| v.date);
     // Return the last one (most recent before cutoff)
     candidates.pop()
+}
+
+fn pip_anchor_window(
+    pkg: &str,
+    version: &str,
+    releases: &[PackageVersion],
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let idx = releases
+        .iter()
+        .position(|v| v.version == version)
+        .with_context(|| format!("Version '{}' not found for '{}'", version, pkg))?;
+
+    let start = releases[idx].date;
+    let end = releases
+        .get(idx + 1)
+        .map(|v| v.date)
+        .unwrap_or_else(Utc::now);
+
+    Ok((start, end))
+}
+
+fn versions_overlapping_window(
+    releases: &[PackageVersion],
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Vec<WindowedVersion> {
+    if releases.is_empty() || window_start >= window_end {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    let mut idx = releases
+        .iter()
+        .rposition(|v| v.date <= window_start)
+        .unwrap_or(0);
+
+    loop {
+        let version = &releases[idx];
+        let next_date = releases.get(idx + 1).map(|v| v.date).unwrap_or(window_end);
+
+        let overlap_start = std::cmp::max(version.date, window_start);
+        let overlap_end = std::cmp::min(next_date, window_end);
+
+        if overlap_start < overlap_end {
+            out.push(WindowedVersion {
+                version: version.version.clone(),
+                overlap_start,
+                overlap_end,
+            });
+        }
+
+        idx += 1;
+        if idx >= releases.len() {
+            break;
+        }
+        if releases[idx].date >= window_end {
+            break;
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn parse_pip_spec_ok() {
+        let (n, v) = parse_pip_spec("requests==2.31.0").unwrap();
+        assert_eq!(n, "requests");
+        assert_eq!(v, "2.31.0");
+    }
+
+    #[test]
+    fn parse_pip_spec_rejects_invalid() {
+        assert!(parse_pip_spec("requests").is_err());
+        assert!(parse_pip_spec("==1.0.0").is_err());
+        assert!(parse_pip_spec("requests==").is_err());
+    }
+
+    fn pv(version: &str, y: i32, m: u32, d: u32) -> PackageVersion {
+        PackageVersion {
+            version: version.to_string(),
+            date: Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn versions_overlapping_window_spans_multiple_versions() {
+        let releases = vec![
+            pv("1.0.0", 2020, 1, 1),
+            pv("1.1.0", 2020, 2, 1),
+            pv("2.0.0", 2020, 3, 1),
+        ];
+        let window_start = Utc.with_ymd_and_hms(2020, 1, 15, 0, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2020, 2, 15, 0, 0, 0).unwrap();
+
+        let got = versions_overlapping_window(&releases, window_start, window_end);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].version, "1.0.0");
+        assert_eq!(got[0].overlap_start, window_start);
+        assert_eq!(got[0].overlap_end, releases[1].date);
+        assert_eq!(got[1].version, "1.1.0");
+        assert_eq!(got[1].overlap_start, releases[1].date);
+        assert_eq!(got[1].overlap_end, window_end);
+    }
+
+    #[test]
+    fn versions_overlapping_window_start_before_first_release() {
+        let releases = vec![pv("0.1.0", 2020, 2, 1)];
+        let window_start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2020, 3, 1, 0, 0, 0).unwrap();
+
+        let got = versions_overlapping_window(&releases, window_start, window_end);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].version, "0.1.0");
+        assert_eq!(got[0].overlap_start, releases[0].date);
+        assert_eq!(got[0].overlap_end, window_end);
+    }
 }
